@@ -1,0 +1,87 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: snipeit
+spec:
+  selector:
+    matchLabels:
+      app: snipeit 
+      tier: frontend
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: snipeit
+        tier: frontend
+    spec:
+      containers:
+      - name: snipe
+        image: $(ECR_URL)
+        # livenessProbe:
+        #   httpGet:
+        #     port: 80
+        resources:
+          limits:
+            memory: 512Mi
+            cpu: "1"
+          requests:
+            memory: 256Mi
+            cpu: "0.2"
+        ports:
+          - containerPort: 80
+        volumeMounts:
+          - name: snipe-pvolume
+            mountPath: /var/lib/snipeit     
+        env:
+          - name: APP_ENV
+            value: "production"
+          - name: APP_DEBUG
+            value: "true"
+          - name: APP_KEY
+            value: $(APP_KEY)
+          - name: APP_URL
+            value: $(APP_URL)
+          - name: APP_TIMEZONE
+            value: "UTC"
+          - name: APP_LOCALE
+            value: "en"
+          - name: MYSQL_PORT_3306_TCP_ADDR
+            value: $(MYSQL_URL)
+          - name: MYSQL_PORT_3306_TCP_PORT
+            value: "3306"
+          - name: MYSQL_DATABASE
+            value: "snipeitdb"
+          - name: MYSQL_USER
+            value: "snipeit"
+          - name: MYSQL_PASSWORD
+            value: $(MYSQL_PASSWORD)
+          - name: MAIL_DRIVER
+            value: "smtp"
+          - name: MAIL_HOST
+            value: "email-smtp.us-east-1.amazonaws.com"
+          - name: MAIL_PORT
+            value: "587"
+          - name: MAIL_USERNAME
+            value: $(MAIL_USERNAME)
+          - name: MAIL_PASSWORD
+            value: $(MAIL_PASSWORD)
+          - name: MAIL_ENCRYPTION
+            value: "TLS" 
+          - name: MAIL_FROM_ADDR
+            value: "peterka60@gmail.com" 
+          - name: MAIL_FROM_NAME
+            value: "Snipe-IT" 
+          - name: MAIL_REPLYTO_ADDR
+            value: "peterka60@gmail.com" 
+          - name: MAIL_REPLYTO_NAME
+            value: "Snipe-IT" 
+          - name: MAIL_AUTO_EMBED
+            value: "true" 
+          - name: MAIL_AUTO_EMBED_METHOD
+            value: "base64"
+      volumes:
+        - name: snipe-pvolume
+          persistentVolumeClaim:
+            claimName: efs-storage-claim

@@ -1,0 +1,13 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: snipeit-loadbalancer
+spec:
+  type: LoadBalancer
+  selector:
+    app: snipeit
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80

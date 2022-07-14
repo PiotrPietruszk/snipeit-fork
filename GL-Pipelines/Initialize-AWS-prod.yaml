@@ -1,0 +1,249 @@
+name: 1.$(Rev:r)
+trigger:
+  branches:
+    exclude:
+      - master
+variables:
+- group: "ACCESS-VARIABLES"
+jobs:
+- job: Job_1
+  displayName: Stand up AWS Infrastructure and export variables
+  pool:
+    vmImage: ubuntu-latest
+  steps:
+  - checkout: self
+  - task: Bash@3
+    displayName: AWS Authentication
+    inputs:
+      targetType: inline
+      script: |
+        #! /bin/bash
+        aws configure set aws_access_key_id $(AWS_KEY_ID)
+        aws configure set aws_secret_access_key $(AWS_SECRET_ACCESS_KEY)
+        aws configure set default.region us-east-1
+  - task: Bash@3
+    displayName: AWS Create S3 bucket
+    inputs:
+      targetType: 'inline'
+      script: |
+        #! /bin/bash
+        aws s3api create-bucket --acl private --bucket gl-piotrpietruszka-snipe-it --region us-east-1
+        aws s3api put-object --bucket gl-piotrpietruszka-snipe-it --key production --acl private
+        aws s3api put-object --bucket gl-piotrpietruszka-snipe-it --key staging --acl private
+  - task: Bash@3
+    displayName: Terraform init-validate-apply
+    inputs:
+      targetType: 'inline'
+      script: |
+        #! /bin/bash 
+        set -e
+        cd GL-terraform-aws-init
+        terraform init -reconfigure
+        terraform validate
+        terraform apply -auto-approve
+#Load balancer is deployed first, because its URL is required as one the container variables.
+  - task: Bash@3
+    displayName: Configure kubectl, install CSI driver and eploy the Load balancer
+    inputs:
+      targetType: 'inline'
+      script: |
+        #! /bin/bash
+        cd GL-k8s
+        aws eks --region us-east-1 update-kubeconfig --name eks-cluster-prod
+        kubectl apply -k "github.com/kubernetes-sigs/aws-efs-csi-driver/deploy/kubernetes/overlays/stable/?ref=master"
+        kubectl apply -f 02-load-balancer.yaml
+        while [$(kubectl get svc snipeit-loadbalancer -o jsonpath='{.status.loadBalancer.ingress[0].hostname}') = ""]
+        do
+          echo "***Load Balancer not ready, waiting 10 seconds"
+          sleep 10
+        done
+        echo "***Load Balancer ready, proceeding"
+  - task: Bash@3
+    displayName: Update Variable Group
+    inputs:
+      targetType: 'inline'
+      script: |
+        #! /bin/bash
+        cd GL-terraform-aws-init
+        az pipelines variable-group variable update --group-id 3 --name EFS_ID --value $(terraform output EFS_ID)
+        az pipelines variable-group variable update --group-id 3 --name MAIL_PASSWORD --value $(terraform output MAIL_PASSWORD)
+        az pipelines variable-group variable update --group-id 3 --name MAIL_USERNAME --value $(terraform output MAIL_USERNAME)
+        az pipelines variable-group variable update --group-id 3 --name MYSQL_URL --value $(terraform output MYSQL_URL)
+        az pipelines variable-group variable update --group-id 3 --name OIDC_ARN --value $(terraform output OIDC_ARN)
+        az pipelines variable-group variable update --group-id 3 --name ECR_URL --value $(terraform output ECR_URL)
+        az pipelines variable-group variable update --group-id 3 --name APP_URL --value $(kubectl get svc snipeit-loadbalancer -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+    env:
+      AZURE_DEVOPS_EXT_PAT: $(PAT)
+  - task: Bash@3
+    displayName: Docker Image build and push
+    inputs:
+      targetType: inline
+      script: |
+        #! /bin/bash
+        docker build -t snipe-it .
+        aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $(ECR_URL)
+        docker tag snipe-it $(ECR_URL)
+        docker push $(ECR_URL)
+  - task: Bash@3
+    displayName: Update K8s files
+    inputs:
+      targetType: inline
+      script: |
+        #! /bin/bash
+        cd GL-k8s
+        cat << EOF > 00-service-account.yaml
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          labels:
+            app.kubernetes.io/name: aws-efs-csi-driver
+          name: snipeit
+          namespace: default
+          annotations:
+            eks.amazonaws.com/role-arn: $(OIDC_ARN)
+        EOF
+        cat << EOF > 01-efs-pvc.yaml
+        ---
+        kind: StorageClass
+        apiVersion: storage.k8s.io/v1
+        metadata:
+          name: efs-sc
+        provisioner: efs.csi.aws.com
+
+        ---
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata:
+          name: efs-pvc
+        spec:
+          capacity:
+            storage: 5Gi
+          volumeMode: Filesystem
+          accessModes:
+            - ReadWriteMany
+          persistentVolumeReclaimPolicy: Retain
+          storageClassName: efs-sc
+          csi:
+            driver: efs.csi.aws.com
+            volumeHandle: $(EFS_ID)
+
+        ---
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: efs-storage-claim
+          namespace: default
+        spec:
+          accessModes:
+            - ReadWriteMany
+          storageClassName: efs-sc
+          resources:
+            requests:
+              storage: 5Gi
+        EOF
+        cat << EOF > 03-snipeit-server.yaml
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: snipeit
+        spec:
+          selector:
+            matchLabels:
+              app: snipeit 
+              tier: frontend
+          strategy:
+            type: Recreate
+          template:
+            metadata:
+              labels:
+                app: snipeit
+                tier: frontend
+            spec:
+              containers:
+              - name: snipe
+                image: $(ECR_URL)
+                # livenessProbe:
+                #   httpGet:
+                #     port: 80
+                resources:
+                  limits:
+                    memory: 512Mi
+                    cpu: "1"
+                  requests:
+                    memory: 256Mi
+                    cpu: "0.2"
+                ports:
+                  - containerPort: 80
+                volumeMounts:
+                  - name: snipe-pvolume
+                    mountPath: /var/lib/snipeit     
+                env:
+                  - name: APP_ENV
+                    value: "production"
+                  - name: APP_DEBUG
+                    value: "true"
+                  - name: APP_KEY
+                    value: $(APP_KEY)
+                  - name: APP_URL
+                    value: $(APP_URL)
+                  - name: APP_TIMEZONE
+                    value: "UTC"
+                  - name: APP_LOCALE
+                    value: "en"
+                  - name: MYSQL_PORT_3306_TCP_ADDR
+                    value: $(MYSQL_URL)
+                  - name: MYSQL_PORT_3306_TCP_PORT
+                    value: "3306"
+                  - name: MYSQL_DATABASE
+                    value: "snipeitdb"
+                  - name: MYSQL_USER
+                    value: "snipeit"
+                  - name: MYSQL_PASSWORD
+                    value: $(MYSQL_PASSWORD)
+                  - name: MAIL_DRIVER
+                    value: "smtp"
+                  - name: MAIL_HOST
+                    value: "email-smtp.us-east-1.amazonaws.com"
+                  - name: MAIL_PORT
+                    value: "587"
+                  - name: MAIL_USERNAME
+                    value: $(MAIL_USERNAME)
+                  - name: MAIL_PASSWORD
+                    value: $(MAIL_PASSWORD)
+                  - name: MAIL_ENCRYPTION
+                    value: "TLS" 
+                  - name: MAIL_FROM_ADDR
+                    value: "peterka60@gmail.com" 
+                  - name: MAIL_FROM_NAME
+                    value: "Snipe-IT" 
+                  - name: MAIL_REPLYTO_ADDR
+                    value: "peterka60@gmail.com" 
+                  - name: MAIL_REPLYTO_NAME
+                    value: "Snipe-IT" 
+                  - name: MAIL_AUTO_EMBED
+                    value: "true" 
+                  - name: MAIL_AUTO_EMBED_METHOD
+                    value: "base64"
+              volumes:
+                - name: snipe-pvolume
+                  persistentVolumeClaim:
+                    claimName: efs-storage-claim
+        EOF
+        cd ..
+        git config --global user.name "AzureDevOps Pipeline"
+        git add .
+        git commit -m "update k8s-test"
+        git push https://$(PAT)@dev.azure.com/GL-PiotrPietruszka/_git/Snipe-IT/ HEAD:master
+  - task: Bash@3
+    displayName: Deploy snipeit
+    inputs:
+      targetType: 'inline'
+      script: |
+        #! /bin/bash
+        cd GL-k8s
+        kubectl apply -f 00-service-account.yaml
+        kubectl apply -f 01-efs-pvc.yaml
+        kubectl apply -f 03-snipeit-server.yaml
+...

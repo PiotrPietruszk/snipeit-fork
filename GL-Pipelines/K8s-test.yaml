@@ -1,0 +1,36 @@
+name: K8s-test.$(Rev:r)
+trigger:
+  branches:
+    exclude:
+      - master
+variables:
+- group: "ACCESS-VARIABLES"
+jobs:
+- job: Job_1
+  displayName: Write parameters into files
+  pool:
+    vmImage: ubuntu-latest
+  steps:
+  - checkout: self
+  - task: Bash@3
+    displayName: 
+    inputs:
+      targetType: inline
+      script: |
+        #! /bin/bash
+        cd GL-k8s
+        cat << EOF > test.yaml
+        test
+        $(EFS_ID)
+        test2
+        EOF
+        cat << EOF > test2.yaml
+        test2
+        $(EFS_ID)
+        test4
+        EOF
+        cd ..
+        git config --global user.name "AzureDevOps Pipeline"
+        git add .
+        git commit -m "update k8s-test"
+        git push https://$(PAT)@dev.azure.com/GL-PiotrPietruszka/_git/Snipe-IT/ HEAD:master
